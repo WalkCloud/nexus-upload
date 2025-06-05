@@ -1,0 +1,440 @@
+import os
+import requests
+import logging
+import getpass
+import xml.etree.ElementTree as ET
+from urllib.parse import urljoin
+from requests.auth import HTTPBasicAuth
+
+# --- 配置日志 ---
+def setup_logging():
+    """配置日志记录器，同时输出到控制台和文件。"""
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("nexus_upload.log", mode='w', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+
+# --- 获取交互式配置 ---
+def get_configuration():
+    """通过交互式提示获取 Nexus 和 .m2 目录的配置信息。"""
+    config = {}
+    print("--- Nexus 配置 ---")
+    print("注意：请输入Nexus的基础URL，不要包含具体仓库路径")
+    print("正确示例: http://localhost:8081 或 http://192.168.36.14:32010")
+    print("错误示例: http://localhost:8081/repository/maven-releases/")
+    
+    config['nexus_url'] = input("请输入 Nexus 基础URL: ").strip().rstrip('/')
+    config['repository_id'] = input("请输入目标 Nexus 仓库 ID (例如 'maven-releases' 或 'maven-snapshots'): ").strip()
+    config['username'] = input("请输入 Nexus 用户名: ").strip()
+    config['password'] = getpass.getpass("请输入 Nexus 密码: ").strip()
+
+    print("\n--- .m2 目录配置 ---")
+    default_m2_path = os.path.join(os.path.expanduser("~"), ".m2", "repository")
+    m2_path_input = input(f"请输入 .m2 仓库目录路径 (默认为 {default_m2_path}): ").strip()
+    config['m2_path'] = m2_path_input if m2_path_input else default_m2_path
+
+    print("\n--- 上传模式配置 ---")
+    print("请选择上传模式:")
+    print("1. 全部上传 (包括 release 和 snapshot)")
+    print("2. 仅上传 release 版本")
+    print("3. 仅上传 snapshot 版本")
+    
+    mode_choice = input("请选择模式 (1/2/3, 默认为1): ").strip()
+    mode_map = {'1': 'all', '2': 'release', '3': 'snapshot', '': 'all'}
+    config['upload_mode'] = mode_map.get(mode_choice, 'all')
+
+    # 验证 .m2 路径是否存在
+    if not os.path.isdir(config['m2_path']):
+        logging.error(f"指定的 .m2 目录路径不存在: {config['m2_path']}")
+        return None
+
+    print("\n--- 配置确认 ---")
+    print(f"Nexus 基础URL: {config['nexus_url']}")
+    print(f"仓库 ID: {config['repository_id']}")
+    print(f"用户名: {config['username']}")
+    print(f".m2 路径: {config['m2_path']}")
+    print(f"上传模式: {config['upload_mode']}")
+    print(f"实际上传URL将是: {config['nexus_url']}/service/rest/v1/components?repository={config['repository_id']}")
+    
+    confirm = input("请确认以上配置是否正确? (y/n): ").strip().lower()
+    if confirm != 'y':
+        logging.info("配置未确认，脚本将退出。")
+        return None
+        
+    return config
+
+# --- 检查版本是否为 snapshot ---
+def is_snapshot_version(version):
+    """检查版本号是否为 snapshot 版本。"""
+    return version and version.upper().endswith('-SNAPSHOT')
+
+# --- 检查 Nexus 连通性 ---
+def check_nexus_connectivity(nexus_url, username, password, repository_id):
+    """检查与 Nexus 服务器的连接是否正常，并验证仓库配置。"""
+    logging.info(f"正在测试与 Nexus ({nexus_url}) 的连接...")
+    try:
+        # 首先测试基本连接
+        response = requests.get(nexus_url, auth=HTTPBasicAuth(username, password), timeout=10)
+        response.raise_for_status()
+        logging.info("✅ Nexus 基本连接成功！")
+        
+        # 测试仓库信息获取
+        repo_info_url = f"{nexus_url}/service/rest/v1/repositories/{repository_id}"
+        logging.info(f"正在检查仓库配置: {repo_info_url}")
+        
+        repo_response = requests.get(repo_info_url, auth=HTTPBasicAuth(username, password), timeout=10)
+        if repo_response.status_code == 200:
+            repo_data = repo_response.json()
+            repo_format = repo_data.get('format', 'unknown')
+            repo_type = repo_data.get('type', 'unknown')
+            
+            # 修正：更准确地获取版本策略
+            repo_policy = 'mixed'  # 默认为混合策略
+            if 'maven' in repo_data:
+                maven_config = repo_data['maven']
+                version_policy = maven_config.get('versionPolicy', 'mixed').lower()
+                # 确保策略名称标准化
+                if version_policy in ['snapshot', 'snapshots']:
+                    repo_policy = 'snapshot'
+                elif version_policy in ['release', 'releases']:
+                    repo_policy = 'release'
+                else:
+                    repo_policy = 'mixed'
+            else:
+                # 如果无法从API获取，通过仓库名称推断
+                repo_name_lower = repository_id.lower()
+                if 'snapshot' in repo_name_lower:
+                    repo_policy = 'snapshot'
+                elif 'release' in repo_name_lower:
+                    repo_policy = 'release'
+                else:
+                    repo_policy = 'mixed'
+            
+            logging.info(f"✅ 仓库 '{repository_id}' 存在")
+            logging.info(f"   仓库格式: {repo_format}")
+            logging.info(f"   仓库类型: {repo_type}")
+            logging.info(f"   版本策略: {repo_policy}")
+            
+            if repo_format.lower() != 'maven2':
+                logging.warning(f"⚠️  仓库格式不是 maven2，可能导致上传失败")
+            
+            if repo_type.lower() not in ['hosted', 'proxy', 'group']:
+                logging.warning(f"⚠️  未知的仓库类型: {repo_type}")
+            
+            # 检查版本策略并给出明确提示
+            if repo_policy == 'snapshot':
+                logging.info("✅ 检测到 Snapshot 仓库，只支持 SNAPSHOT 版本上传")
+            elif repo_policy == 'release':
+                logging.info("✅ 检测到 Release 仓库，只支持 RELEASE 版本上传")
+            else:
+                logging.info("✅ 检测到 Mixed 仓库，支持所有版本上传")
+            
+            return True, repo_policy
+                
+        elif repo_response.status_code == 404:
+            logging.error(f"❌ 仓库 '{repository_id}' 不存在，请检查仓库ID")
+            return False, None
+        elif repo_response.status_code == 403:
+            logging.error(f"❌ 没有权限访问仓库 '{repository_id}'，请检查用户权限")
+            return False, None
+        else:
+            logging.warning(f"⚠️  无法获取仓库信息 (状态码: {repo_response.status_code})，将通过仓库名称推断策略")
+            # 通过仓库名称推断策略
+            repo_name_lower = repository_id.lower()
+            if 'snapshot' in repo_name_lower:
+                return True, 'snapshot'
+            elif 'release' in repo_name_lower:
+                return True, 'release'
+            else:
+                return True, 'mixed'
+        
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"❌ Nexus 连接失败: 无法连接到服务器。请检查 URL 和网络。 {e}")
+        return False, None
+    except requests.exceptions.Timeout as e:
+        logging.error(f"❌ Nexus 连接失败: 请求超时。 {e}")
+        return False, None
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401:
+            logging.error(f"❌ Nexus 连接失败: 认证失败 (401 Unauthorized)。请检查用户名和密码。 {e}")
+        else:
+            logging.error(f"❌ Nexus 连接失败: HTTP 错误 - {e.response.status_code} {e.response.reason}。 {e}")
+        return False, None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Nexus 连接失败: 发生未知请求错误。 {e}")
+        return False, None
+
+# --- 解析 POM 文件获取 GAV ---
+def get_gav_from_pom(pom_file_path):
+    """从 POM 文件中解析 GroupId, ArtifactId, Version。"""
+    try:
+        tree = ET.parse(pom_file_path)
+        root = tree.getroot()
+        namespace = root.tag.split('}')[0] + '}' if '}' in root.tag else ''
+
+        group_id = root.findtext(f'{namespace}groupId')
+        artifact_id = root.findtext(f'{namespace}artifactId')
+        version = root.findtext(f'{namespace}version')
+
+        # 如果 POM 中没有 GAV，尝试从父 POM 获取
+        parent = root.find(f'{namespace}parent')
+        if parent is not None:
+            if not group_id:
+                group_id = parent.findtext(f'{namespace}groupId')
+            if not version:
+                version = parent.findtext(f'{namespace}version')
+        
+        if group_id and artifact_id and version:
+            return group_id, artifact_id, version
+        else:
+            logging.warning(f"无法从 {pom_file_path} 中完整解析 GAV。")
+            return None, None, None
+    except ET.ParseError as e:
+        logging.error(f"解析 POM 文件 {pom_file_path} 失败: {e}")
+        return None, None, None
+    except Exception as e:
+        logging.error(f"处理 POM 文件 {pom_file_path} 时发生意外错误: {e}")
+        return None, None, None
+
+# --- 检查版本是否应该上传 ---
+def should_upload_version(version, upload_mode, repo_policy):
+    """根据上传模式和仓库策略检查版本是否应该上传。"""
+    is_snapshot = is_snapshot_version(version)
+    
+    # 首先检查仓库策略（最重要的约束）
+    if repo_policy == 'release' and is_snapshot:
+        return False, f"目标仓库为 RELEASE 仓库，不支持 SNAPSHOT 版本 ({version})"
+    elif repo_policy == 'snapshot' and not is_snapshot:
+        return False, f"目标仓库为 SNAPSHOT 仓库，不支持 RELEASE 版本 ({version})"
+    
+    # 然后检查用户选择的上传模式
+    if upload_mode == 'release' and is_snapshot:
+        return False, f"上传模式为 'release'，跳过 SNAPSHOT 版本 ({version})"
+    elif upload_mode == 'snapshot' and not is_snapshot:
+        return False, f"上传模式为 'snapshot'，跳过 RELEASE 版本 ({version})"
+    
+    return True, None
+
+# --- 上传单个构件到 Nexus ---
+def upload_artifact(nexus_url, repository_id, username, password, file_path, group_id, artifact_id, version, extension, classifier=None, repo_policy='mixed'):
+    """上传单个构件文件到 Nexus 仓库。"""
+    # 统一使用 REST API 上传方式，更稳定
+    return upload_via_rest_api(nexus_url, repository_id, username, password, file_path, group_id, artifact_id, version, extension, classifier)
+
+def upload_via_rest_api(nexus_url, repository_id, username, password, file_path, group_id, artifact_id, version, extension, classifier=None):
+    """通过 REST API 上传构件到 Nexus 仓库。"""
+    upload_url = f"{nexus_url}/service/rest/v1/components?repository={repository_id}"
+    
+    # GAV 信息作为表单数据
+    data = {
+        'maven2.groupId': group_id,
+        'maven2.artifactId': artifact_id,
+        'maven2.version': version,
+        'maven2.asset1.extension': extension,
+    }
+    
+    # 如果有分类器，添加到表单数据
+    if classifier:
+        data['maven2.asset1.classifier'] = classifier
+
+    logging.info(f"正在上传: {group_id}:{artifact_id}:{version} ({os.path.basename(file_path)}) 到仓库 '{repository_id}'...")
+    logging.debug(f"上传URL: {upload_url}")
+    logging.debug(f"数据: {data}")
+
+    try:
+        with open(file_path, 'rb') as f:
+            files = {
+                'maven2.asset1': (os.path.basename(file_path), f, 'application/octet-stream')
+            }
+            
+            response = requests.post(
+                upload_url, 
+                auth=HTTPBasicAuth(username, password),
+                data=data,
+                files=files,
+                timeout=300 
+            )
+        
+        response.raise_for_status()
+        logging.info(f"✅ 上传成功: {os.path.basename(file_path)}")
+        return True
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 400:
+            response_text = e.response.text.lower()
+            if "already exists" in response_text or "asset already exists" in response_text:
+                logging.info(f"ℹ️  跳过上传: {os.path.basename(file_path)} 已存在于仓库中")
+                return True
+            elif "version policy" in response_text or "snapshot" in response_text or "release" in response_text:
+                logging.error(f"❌ 版本策略冲突: {os.path.basename(file_path)}")
+                logging.error(f"   错误详情: {e.response.text}")
+                logging.error(f"   提示: 请检查仓库版本策略设置")
+                return False
+            else:
+                logging.error(f"❌ 上传失败 (400 Bad Request): {os.path.basename(file_path)}")
+                logging.error(f"   错误详情: {e.response.text}")
+                return False
+        elif e.response.status_code == 404:
+            logging.error(f"❌ 仓库 '{repository_id}' 不存在或无法访问")
+            return False
+        elif e.response.status_code == 403:
+            logging.error(f"❌ 没有权限上传到仓库 '{repository_id}'")
+            return False
+        else:
+            logging.error(f"❌ 上传失败: {os.path.basename(file_path)} - HTTP {e.response.status_code}")
+            logging.error(f"   错误详情: {e.response.text}")
+            return False
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ 上传时发生网络错误: {os.path.basename(file_path)} - {e}")
+        return False
+    except Exception as e:
+        logging.error(f"❌ 上传时发生未知错误: {os.path.basename(file_path)} - {e}")
+        return False
+
+# --- 遍历 .m2 目录并处理上传 ---
+def process_m2_directory(config, repo_policy='mixed'):
+    """遍历 .m2 目录，找到 POM 文件并尝试上传关联的构件。"""
+    m2_path = config['m2_path']
+    upload_mode = config['upload_mode']
+    success_count = 0
+    fail_count = 0
+    skip_count = 0
+    
+    # 定义要忽略的文件扩展名和特定文件名
+    ignored_extensions = ('.sha1', '.md5', '.asc') 
+    ignored_files = ('_remote.repositories', 'resolver-status.properties')
+
+    logging.info(f"--- 开始遍历 {m2_path} ---")
+    logging.info(f"--- 目标仓库: {config['repository_id']} (策略: {repo_policy.upper()}) ---")
+    logging.info(f"--- 上传模式: {upload_mode.upper()} ---")
+
+    # 添加策略兼容性检查
+    if repo_policy == 'release' and upload_mode == 'snapshot':
+        logging.error("❌ 配置冲突: 目标仓库只支持 RELEASE 版本，但上传模式为 SNAPSHOT")
+        logging.error("   请选择支持 SNAPSHOT 的仓库或更改上传模式为 RELEASE")
+        return
+    elif repo_policy == 'snapshot' and upload_mode == 'release':
+        logging.error("❌ 配置冲突: 目标仓库只支持 SNAPSHOT 版本，但上传模式为 RELEASE")
+        logging.error("   请选择支持 RELEASE 的仓库或更改上传模式为 SNAPSHOT")
+        return
+
+    for root, dirs, files in os.walk(m2_path):
+        pom_file = next((f for f in files if f.endswith('.pom')), None)
+
+        if pom_file:
+            pom_file_path = os.path.join(root, pom_file)
+            group_id, artifact_id, version = get_gav_from_pom(pom_file_path)
+
+            if group_id and artifact_id and version:
+                # 检查版本是否应该上传
+                should_upload, skip_reason = should_upload_version(version, upload_mode, repo_policy)
+                if not should_upload:
+                    logging.debug(f"跳过: {group_id}:{artifact_id}:{version} - {skip_reason}")
+                    skip_count += 1
+                    continue
+
+                is_snapshot = is_snapshot_version(version)
+                version_type = "SNAPSHOT" if is_snapshot else "RELEASE"
+                
+                logging.debug(f"找到 POM: {pom_file_path} -> {group_id}:{artifact_id}:{version} [{version_type}]")
+                
+                expected_path_part = os.path.join(group_id.replace('.', os.sep), artifact_id, version)
+                if expected_path_part not in root.replace(m2_path, ''):
+                    logging.warning(f"路径 {root} 与 POM 中的 GAV {group_id}:{artifact_id}:{version} 不匹配，跳过。")
+                    skip_count += 1
+                    continue
+
+                # --- 首先上传 POM ---
+                if upload_artifact(config['nexus_url'], config['repository_id'], config['username'], config['password'], 
+                                 pom_file_path, group_id, artifact_id, version, 'pom', repo_policy=repo_policy):
+                     success_count += 1
+                else:
+                     fail_count += 1
+                     continue
+
+                # --- 然后查找并上传其他构件 ---
+                base_name = f"{artifact_id}-{version}"
+                for potential_file in os.listdir(root):
+                    file_path = os.path.join(root, potential_file)
+
+                    # --- 过滤条件 ---
+                    if not os.path.isfile(file_path) or \
+                       potential_file == pom_file or \
+                       potential_file.endswith(ignored_extensions) or \
+                       potential_file in ignored_files:
+                        if potential_file.endswith(ignored_extensions):
+                           logging.debug(f"跳过校验和/元数据文件: {potential_file}")
+                        continue
+                        
+                    # 只处理以 <artifactId>-<version> 开头的文件
+                    if potential_file.startswith(base_name):
+                        parts = potential_file.replace(base_name, '', 1)
+                        extension = ''
+                        classifier = None
+
+                        if parts.startswith('-'):
+                            classifier_ext = parts[1:].split('.')
+                            if len(classifier_ext) >= 2:
+                                classifier = classifier_ext[0]
+                                extension = '.'.join(classifier_ext[1:])
+                            else:
+                                logging.warning(f"无法解析文件名格式 (分类器): {potential_file}，跳过。")
+                                skip_count += 1
+                                continue
+                        elif parts.startswith('.'):
+                            extension = parts[1:]
+                        else:
+                            logging.warning(f"无法识别的文件格式: {potential_file}，跳过。")
+                            skip_count += 1
+                            continue
+
+                        if extension:
+                            if upload_artifact(config['nexus_url'], config['repository_id'], config['username'], config['password'], 
+                                             file_path, group_id, artifact_id, version, extension, classifier, repo_policy=repo_policy):
+                                success_count += 1
+                            else:
+                                fail_count += 1
+                        else:
+                             logging.warning(f"未能确定 {potential_file} 的扩展名，跳过。")
+                             skip_count += 1
+            else:
+                skip_count += 1
+
+    logging.info("--- 遍历完成 ---")
+    logging.info(f"总计: 成功上传 {success_count} 个构件, 失败 {fail_count} 个, 跳过 {skip_count} 个。")
+    
+    if fail_count > 0:
+        logging.warning("存在上传失败的构件，请检查日志了解详细原因。")
+
+# --- 主函数 ---
+def main():
+    """脚本主入口点。"""
+    setup_logging()
+    logging.info("--- 启动 Nexus 依赖批量上传脚本 (增强版) ---")
+
+    config = get_configuration()
+    if not config:
+        logging.info("脚本因配置问题退出。")
+        return
+
+    connectivity_result = check_nexus_connectivity(config['nexus_url'], config['username'], config['password'], config['repository_id'])
+    if not connectivity_result[0]:
+        logging.info("脚本因 Nexus 连接问题退出。")
+        return
+    
+    repo_policy = connectivity_result[1] if len(connectivity_result) > 1 else 'mixed'
+
+    try:
+        process_m2_directory(config, repo_policy)
+    except Exception as e:
+        logging.critical(f"脚本执行过程中发生严重错误: {e}", exc_info=True)
+
+    logging.info("--- 脚本执行完毕 ---")
+
+# --- 运行主函数 ---
+if __name__ == "__main__":
+    main()
